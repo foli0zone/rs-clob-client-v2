@@ -2176,6 +2176,27 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Raw variant of [`Self::trades`]: the same authenticated request and
+    /// paging, but each page item is returned as undecoded JSON. For callers
+    /// that must survive a single malformed trade (for example an
+    /// empty-string decimal field the venue occasionally emits in old
+    /// history) without losing the rest of the page — they decode per item
+    /// and decide what a skipped trade means for their own completeness.
+    pub async fn trades_raw(
+        &self,
+        request: &TradesRequest,
+        next_cursor: Option<String>,
+    ) -> Result<Page<serde_json::Value>> {
+        let params = request.query_params(next_cursor.as_deref());
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}data/trades{params}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
     /// Retrieves all notifications for the authenticated user.
     ///
     /// Returns order fill notifications, cancellations, and other trading events.
