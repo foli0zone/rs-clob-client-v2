@@ -2281,7 +2281,18 @@ impl<K: Kind> Client<Authenticated<K>> {
 
         // We have to send the request separately from `self.request` because this endpoint does
         // not return anything in the response body. Otherwise, we would get an EOF error from reqwest
-        self.client().execute(request).await?;
+        //
+        // The STATUS still matters even though the body does not: a 401/429/5xx
+        // here means the venue's cached balance was NOT recomputed, and a caller
+        // that reads Ok(()) as "refreshed" will then trust a stale figure from
+        // the very cache it asked to invalidate. (Observed 2026-08-31: nineteen
+        // redeemed positions kept reading as held because a failed refresh
+        // returned Ok.) The official Python client rejects non-2xx on this same
+        // endpoint through its shared HTTP helper.
+        self.client()
+            .execute(request)
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }
