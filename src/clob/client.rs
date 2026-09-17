@@ -2310,10 +2310,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         // redeemed positions kept reading as held because a failed refresh
         // returned Ok.) The official Python client rejects non-2xx on this same
         // endpoint through its shared HTTP helper.
-        self.client()
-            .execute(request)
-            .await?
-            .error_for_status()?;
+        self.client().execute(request).await?.error_for_status()?;
 
         Ok(())
     }
