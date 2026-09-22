@@ -445,7 +445,35 @@ pub struct Config {
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
     heartbeat_interval: Duration,
+    /// How long any ONE HTTP request may take before it is abandoned.
+    ///
+    /// Without this the transport has no timeout at all, and a host that
+    /// accepts the connection and then stops answering blocks the caller
+    /// **forever** rather than failing it.
+    ///
+    /// This is the right layer for the bound because every method here is a
+    /// single request. A caller that wraps whole SDK methods instead ends up
+    /// bounding a *sequence*: with `use_server_time` every authenticated call
+    /// is `GET /time` followed by the request, and [`Client::authenticate`] is
+    /// normally four round trips (`create_api_key`, the "already exists"
+    /// answer, `derive_api_key`, each with its own time fetch) plus a cold
+    /// TCP/TLS handshake. A per-call budget sized from a single round trip is
+    /// therefore wrong by 2-4x wherever it is applied, which is how such a
+    /// wrapper turns a slow-but-working venue into failures.
+    ///
+    /// Default [`DEFAULT_REQUEST_TIMEOUT`]. Raise or lower it per client.
+    #[builder(default = DEFAULT_REQUEST_TIMEOUT)]
+    request_timeout: Duration,
 }
+
+/// Default for [`Config::request_timeout`]: 15 seconds.
+///
+/// Long enough that a merely slow venue does not produce spurious failures —
+/// public CLOB reads measured 2026-09-22 were p50 768 ms, p90 1.22 s,
+/// p99 2.16 s over 60 samples — and short enough that nothing waits forever.
+/// It bounds one round trip, so a method that makes several may still take a
+/// multiple of it; bounding a whole operation is the caller's job.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Default for Config {
     fn default() -> Self {
@@ -455,6 +483,7 @@ impl Default for Config {
             builder_code: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 }
@@ -1491,7 +1520,10 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .timeout(config.request_timeout)
+            .build()?;
 
         let geoblock_host = Url::parse(
             config
@@ -2291,10 +2323,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         // redeemed positions kept reading as held because a failed refresh
         // returned Ok.) The official Python client rejects non-2xx on this same
         // endpoint through its shared HTTP helper.
-        self.client()
-            .execute(request)
-            .await?
-            .error_for_status()?;
+        self.client().execute(request).await?.error_for_status()?;
 
         Ok(())
     }
