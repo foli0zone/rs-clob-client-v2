@@ -382,7 +382,13 @@ pub struct Client<S: State = Unauthenticated> {
 /// We also have a [`Receiver<()>`] to notify when the inner [`Client`] has been dropped so that
 /// we can avoid a race condition when calling [`Arc::into_inner`] on promotion and demotion methods.
 #[derive(Clone, Debug, Default)]
-struct DroppingCancellationToken(Option<(CancellationToken, Arc<Receiver<()>>)>);
+struct DroppingCancellationToken(
+    Option<(
+        CancellationToken,
+        Arc<Receiver<()>>,
+        Arc<std::sync::atomic::AtomicU64>,
+    )>,
+);
 
 #[cfg(feature = "heartbeats")]
 impl DroppingCancellationToken {
@@ -390,7 +396,7 @@ impl DroppingCancellationToken {
     /// [`Receiver`]. This is primarily used by the authentication methods when promoting [`Client`]s
     /// to ensure that we do not error when transferring ownership of [`ClientInner`].
     pub(crate) async fn cancel_and_wait(&mut self) -> Result<()> {
-        if let Some((token, rx)) = self.0.take() {
+        if let Some((token, rx, ack)) = self.0.take() {
             return match Arc::try_unwrap(rx) {
                 // If this is the only reference, cancel the token and wait for the resources to be
                 // cleaned up.
@@ -401,7 +407,7 @@ impl DroppingCancellationToken {
                 }
                 // If not, _save_ the original token and receiver to re-use later if desired
                 Err(original) => {
-                    *self = DroppingCancellationToken(Some((token, original)));
+                    *self = DroppingCancellationToken(Some((token, original, ack)));
                     Err(Synchronization.into())
                 }
             };
@@ -414,7 +420,7 @@ impl DroppingCancellationToken {
 #[cfg(feature = "heartbeats")]
 impl Drop for DroppingCancellationToken {
     fn drop(&mut self) {
-        if let Some((token, _)) = self.0.take() {
+        if let Some((token, _, _)) = self.0.take() {
             token.cancel();
         }
     }
@@ -1730,17 +1736,45 @@ impl<K: Kind> Client<Authenticated<K>> {
         self.order_builder()
     }
 
-    /// Signs the provided [`SignableOrder`] using EIP-712 typed data signing.
-    ///
-    /// The EIP-712 domain and verifying contract are selected from the order's version:
-    /// V2 orders sign against `exchange_v2` with domain version `"2"`; V1 orders sign
-    /// against the legacy `exchange` (or neg-risk variant) with domain version `"1"`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "No need to publicly document as we are guarded by the typestate pattern. \
-        We cannot call `sign` without first calling `authenticate`"
-    )]
-    pub async fn sign<S: Signer>(
+    /// Signs an order using the legacy order-protocol domain selection.
+    /// Native Position Protocol V2 integrations use [`Self::sign_with_domain`]
+    /// with the verified ExchangeV3/domain 3; the order payload stays V2.
+    pub async fn sign<S: Signer>(&self, signer: &S, order: SignableOrder) -> Result<SignedOrder> {
+        let chain_id = signer
+            .chain_id()
+            .ok_or_else(|| Error::validation("Signer chain ID missing"))?;
+        let token_id = match &order.payload {
+            OrderPayload::V1(p) => p.order.tokenId,
+            OrderPayload::V2(p) => p.order.tokenId,
+        };
+        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
+        let config = contract_config(chain_id, neg_risk)
+            .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
+        let (version, exchange) = match &order.payload {
+            OrderPayload::V2(_) => (VERSION_V2, config.exchange_v2.ok_or_else(|| {
+                Error::validation(format!("No V2 exchange contract configured for chain_id={chain_id}, neg_risk={neg_risk}"))
+            })?),
+            OrderPayload::V1(_) => (VERSION_V1, config.exchange),
+        };
+        self.sign_with_domain(
+            signer,
+            order,
+            Eip712Domain {
+                name: ORDER_NAME,
+                version,
+                chain_id: Some(U256::from(chain_id)),
+                verifying_contract: Some(exchange),
+                ..Eip712Domain::default()
+            },
+        )
+        .await
+    }
+
+    /// Signs with an explicitly verified application domain, sharing the same
+    /// `POLY_1271` wrapping as [`Self::sign`]. The caller owns position-protocol
+    /// selection; this does not infer it from the global order API version.
+    /// Rejects a domain on a different chain or without a verifying contract.
+    pub async fn sign_with_domain<S: Signer>(
         &self,
         signer: &S,
         SignableOrder {
@@ -1749,58 +1783,32 @@ impl<K: Kind> Client<Authenticated<K>> {
             post_only,
             defer_exec,
         }: SignableOrder,
+        domain: Eip712Domain,
     ) -> Result<SignedOrder> {
         let chain_id = signer
             .chain_id()
-            .expect("Validated not none in `authenticate`");
-
-        let token_id = match &payload {
-            OrderPayload::V1(p) => p.order.tokenId,
-            OrderPayload::V2(p) => p.order.tokenId,
-        };
-        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
-        let config = contract_config(chain_id, neg_risk)
-            .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
-
+            .ok_or_else(|| Error::validation("Signer chain ID missing"))?;
+        if domain.chain_id != Some(U256::from(chain_id))
+            || domain.verifying_contract.is_none_or(|a| a == Address::ZERO)
+        {
+            return Err(Error::validation(
+                "Signing domain chain or verifying contract is invalid",
+            ));
+        }
         let signature = match &payload {
-            OrderPayload::V2(p) => {
-                let exchange = config.exchange_v2.ok_or_else(|| {
-                    Error::validation(format!(
-                        "No V2 exchange contract configured for chain_id={chain_id}, neg_risk={neg_risk}"
-                    ))
-                })?;
-                let domain = Eip712Domain {
-                    name: ORDER_NAME,
-                    version: VERSION_V2,
-                    chain_id: Some(U256::from(chain_id)),
-                    verifying_contract: Some(exchange),
-                    ..Eip712Domain::default()
-                };
-                if p.order.signatureType == SignatureType::Poly1271 as u8 {
-                    self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
-                        .await?
-                } else {
-                    signer
-                        .sign_hash(&p.order.eip712_signing_hash(&domain))
-                        .await?
-                        .into()
-                }
-            }
-            OrderPayload::V1(p) => {
-                let domain = Eip712Domain {
-                    name: ORDER_NAME,
-                    version: VERSION_V1,
-                    chain_id: Some(U256::from(chain_id)),
-                    verifying_contract: Some(config.exchange),
-                    ..Eip712Domain::default()
-                };
-                signer
-                    .sign_hash(&p.order.eip712_signing_hash(&domain))
+            OrderPayload::V2(p) if p.order.signatureType == SignatureType::Poly1271 as u8 => {
+                self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
                     .await?
-                    .into()
             }
+            OrderPayload::V2(p) => signer
+                .sign_hash(&p.order.eip712_signing_hash(&domain))
+                .await?
+                .into(),
+            OrderPayload::V1(p) => signer
+                .sign_hash(&p.order.eip712_signing_hash(&domain))
+                .await?
+                .into(),
         };
-
         Ok(SignedOrder {
             payload,
             signature,
@@ -2291,10 +2299,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         // redeemed positions kept reading as held because a failed refresh
         // returned Ok.) The official Python client rejects non-2xx on this same
         // endpoint through its shared HTTP helper.
-        self.client()
-            .execute(request)
-            .await?
-            .error_for_status()?;
+        self.client().execute(request).await?.error_for_status()?;
 
         Ok(())
     }
@@ -2740,6 +2745,30 @@ impl<K: Kind> Client<Authenticated<K>> {
     }
 
     #[cfg(feature = "heartbeats")]
+    async fn heartbeat_tick(&self, heartbeat_id: &mut Option<Uuid>) -> Result<()> {
+        let mut result = self.post_heartbeat(*heartbeat_id).await;
+        if let Err(error) = &result
+            && let Some(expected) = expected_heartbeat_id(error)
+            && Some(expected) != *heartbeat_id
+        {
+            *heartbeat_id = Some(expected);
+            // Build and authenticate a new request for this exact body.
+            result = self.post_heartbeat(*heartbeat_id).await;
+        }
+        *heartbeat_id = Some(result?.heartbeat_id);
+        Ok(())
+    }
+
+    #[cfg(feature = "heartbeats")]
+    /// Last successful automatic heartbeat ACK, in Unix milliseconds.
+    /// None before the first success, or when no automatic task is active.
+    #[must_use]
+    pub fn last_heartbeat_ack_ms(&self) -> Option<u64> {
+        let value = self.heartbeat_token.0.as_ref()?.2.load(Ordering::Acquire);
+        (value != 0).then_some(value)
+    }
+
+    #[cfg(feature = "heartbeats")]
     /// Checks if automatic heartbeats are currently active.
     ///
     /// Returns `true` if the heartbeat background task is running, `false` otherwise.
@@ -2774,6 +2803,8 @@ impl<K: Kind> Client<Authenticated<K>> {
 
         let token_clone = token.clone();
         let client_clone = client.clone();
+        let ack = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_ack = Arc::clone(&ack);
 
         tokio::task::spawn(async move {
             let mut heartbeat_id: Option<Uuid> = None;
@@ -2789,11 +2820,11 @@ impl<K: Kind> Client<Authenticated<K>> {
                         break
                     },
                     _ = ticker.tick() => {
-                        match client_clone.post_heartbeat(heartbeat_id).await {
-                            Ok(response) => {
+                        match client_clone.heartbeat_tick(&mut heartbeat_id).await {
+                            Ok(()) => {
                                 #[cfg(feature = "tracing")]
-                                debug!("Heartbeat successfully sent: {response:?}");
-                                heartbeat_id = Some(response.heartbeat_id);
+                                debug!("Heartbeat successfully acknowledged");
+                                task_ack.store(Utc::now().timestamp_millis().try_into().unwrap_or(0), Ordering::Release);
                             },
                             Err(e) => {
                                 #[cfg(feature = "tracing")]
@@ -2809,7 +2840,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             tx.send(())
         });
 
-        client.heartbeat_token = DroppingCancellationToken(Some((token, Arc::new(rx))));
+        client.heartbeat_token = DroppingCancellationToken(Some((token, Arc::new(rx), ack)));
 
         Ok(())
     }
@@ -3082,4 +3113,15 @@ mod tests {
     fn client_default_should_succeed() {
         _ = Client::default();
     }
+}
+
+#[cfg(feature = "heartbeats")]
+fn expected_heartbeat_id(error: &Error) -> Option<Uuid> {
+    let status = error.downcast_ref::<crate::error::Status>()?;
+    if status.status_code != reqwest::StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(&status.message).ok()?;
+    let id = Uuid::parse_str(body.get("heartbeat_id")?.as_str()?).ok()?;
+    (!id.is_nil()).then_some(id)
 }

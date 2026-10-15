@@ -82,6 +82,9 @@ pub struct Token {
 pub struct StatusResponse {
     /// List of transactions for the given address
     pub transactions: Vec<DepositTransaction>,
+    /// Explicit null means exhausted; omission is an invalid response.
+    #[serde(deserialize_with = "required_cursor")]
+    pub next_cursor: Option<String>,
 }
 
 #[non_exhaustive]
@@ -195,4 +198,10 @@ pub struct WithdrawalAddresses {
     pub svm: String,
     /// Bitcoin deposit address.
     pub btc: String,
+}
+
+fn required_cursor<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    serde::Deserialize::deserialize(d)
 }

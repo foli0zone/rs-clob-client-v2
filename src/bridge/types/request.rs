@@ -40,6 +40,10 @@ pub struct DepositRequest {
 #[builder(on(String, into))]
 pub struct StatusRequest {
     pub address: String,
+    /// Page size, 1 through 100 (server default 50).
+    pub limit: Option<u16>,
+    /// Opaque nextCursor from this address's previous page.
+    pub cursor: Option<String>,
 }
 
 #[non_exhaustive]
