@@ -191,12 +191,28 @@ impl Client {
     ///
     /// ```
     pub async fn status(&self, request: &StatusRequest) -> Result<StatusResponse> {
+        if request
+            .limit
+            .is_some_and(|limit| !(1..=100).contains(&limit))
+        {
+            return Err(crate::error::Error::validation(
+                "Bridge limit must be 1..=100",
+            ));
+        }
+        let mut query = Vec::new();
+        if let Some(limit) = request.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &request.cursor {
+            query.push(("cursor", cursor.clone()));
+        }
         let request = self
             .client()
             .request(
                 Method::GET,
                 format!("{}status/{}", self.host(), request.address),
             )
+            .query(&query)
             .build()?;
 
         crate::request(&self.client, request, None).await

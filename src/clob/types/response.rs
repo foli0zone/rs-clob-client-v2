@@ -349,6 +349,28 @@ where
     }
 }
 
+/// A decimal the venue occasionally sends as `""` in trade history
+/// (foli0zone/mercury#1427: one such trade rejected the WHOLE page). `""`
+/// means the venue did not state the value, so it decodes to `None` — not to
+/// zero, which would claim a fee rate nobody stated. `null` and a missing
+/// field decode to `None` too; anything else must parse.
+pub fn empty_string_as_none_decimal<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => s
+            .parse::<Decimal>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[non_exhaustive]
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, Builder, PartialEq)]
@@ -404,7 +426,9 @@ pub struct TradeResponse {
     pub asset_id: U256,
     pub side: Side,
     pub size: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// `None` when the venue sent `""`/`null`/nothing: unknown, not zero.
+    #[serde(default, deserialize_with = "empty_string_as_none_decimal")]
+    pub fee_rate_bps: Option<Decimal>,
     pub price: Decimal,
     pub status: TradeStatusType,
     #[serde_as(as = "TimestampSeconds<String>")]
@@ -537,7 +561,9 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// `None` when the venue sent `""`/`null`/nothing: unknown, not zero.
+    #[serde(default, deserialize_with = "empty_string_as_none_decimal")]
+    pub fee_rate_bps: Option<Decimal>,
     pub asset_id: U256,
     pub outcome: String,
     pub side: Side,
@@ -917,4 +943,84 @@ pub struct RfqQuote {
     pub size_out: Decimal,
     /// Quoted price.
     pub price: Decimal,
+}
+
+#[cfg(test)]
+mod fee_rate_bps_tests {
+    use super::*;
+
+    /// The SDK's own `/data/trades` test payload (tests/clob.rs `trade_json`),
+    /// with `fee_rate_bps` set to the exact `""` production rejected
+    /// (foli0zone/mercury#1427, and the same page failure seen on a pm-bots
+    /// wallet on 2026-09-03), on both the trade and one maker order.
+    fn trade(fee: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "trade-1",
+            "taker_order_id": "taker_123",
+            "market": "0x000000000000000000000000000000000000000000000000000000006d61726b",
+            "asset_id": "1234",
+            "side": "BUY",
+            "size": "12.5",
+            "fee_rate_bps": fee,
+            "price": "0.42",
+            "status": "MATCHED",
+            "match_time": "1705322096",
+            "last_update": "1705322130",
+            "outcome": "YES",
+            "bucket_index": 2,
+            "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "maker_address": "0x2222222222222222222222222222222222222222",
+            "maker_orders": [{
+                "order_id": "maker_1",
+                "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "maker_address": "0x3333333333333333333333333333333333333333",
+                "matched_amount": "12.5",
+                "price": "0.42",
+                "fee_rate_bps": fee,
+                "asset_id": "1234",
+                "outcome": "YES",
+                "side": "SELL"
+            }],
+            "transaction_hash": "",
+            "trader_side": "TAKER"
+        })
+    }
+
+    #[test]
+    fn an_empty_fee_rate_is_unknown_not_a_page_failure() {
+        let decoded: TradeResponse = serde_json::from_value(trade("")).expect("decodes");
+        assert_eq!(decoded.fee_rate_bps, None);
+        assert_eq!(decoded.maker_orders[0].fee_rate_bps, None);
+        // The economic fields the venue DID state survive intact.
+        assert_eq!(decoded.size, "12.5".parse::<Decimal>().unwrap());
+        assert_eq!(
+            decoded.maker_orders[0].matched_amount,
+            "12.5".parse::<Decimal>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stated_fee_rate_still_parses() {
+        let decoded: TradeResponse = serde_json::from_value(trade("5")).expect("decodes");
+        assert_eq!(decoded.fee_rate_bps, Some(Decimal::from(5)));
+        assert_eq!(decoded.maker_orders[0].fee_rate_bps, Some(Decimal::from(5)));
+    }
+
+    #[test]
+    fn a_missing_or_null_fee_rate_is_unknown_too() {
+        let mut value = trade("5");
+        value["fee_rate_bps"] = serde_json::Value::Null;
+        value["maker_orders"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("fee_rate_bps");
+        let decoded: TradeResponse = serde_json::from_value(value).expect("decodes");
+        assert_eq!(decoded.fee_rate_bps, None);
+        assert_eq!(decoded.maker_orders[0].fee_rate_bps, None);
+    }
+
+    #[test]
+    fn garbage_in_the_fee_rate_is_still_rejected() {
+        serde_json::from_value::<TradeResponse>(trade("abc")).expect_err("garbage must not parse");
+    }
 }

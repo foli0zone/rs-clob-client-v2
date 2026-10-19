@@ -278,7 +278,8 @@ mod deposit_status {
                         "status": "DEPOSIT_DETECTED",
 
                     }
-                ]
+                ],
+                "nextCursor": null
             }));
         });
 
