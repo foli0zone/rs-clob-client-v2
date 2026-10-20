@@ -3273,6 +3273,40 @@ mod authenticated {
 
         Ok(())
     }
+
+    /// Every `OrderBuilder` carries a clone of the client's heartbeat handle. Dropping one used to
+    /// cancel the heartbeats of every clone, so a client stopped heartbeating the first time it
+    /// built an order, and the venue then cancels every open order the credential owns.
+    #[cfg(feature = "heartbeats")]
+    #[tokio::test]
+    async fn dropping_an_order_builder_should_not_stop_heartbeats() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let heartbeats = server.mock(|when, then| {
+            when.method(POST).path("/v1/heartbeats");
+            then.status(StatusCode::OK).json_body(json!({
+                "heartbeat_id": Uuid::new_v4(),
+                "error": null
+            }));
+        });
+        let config = Config::builder()
+            .use_server_time(true)
+            .heartbeat_interval(Duration::from_millis(100))
+            .build();
+        let client = crate::common::create_authenticated_with_config(&server, config).await?;
+
+        drop(client.limit_order());
+        let before = heartbeats.calls();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(client.heartbeats_active());
+        assert!(
+            heartbeats.calls() > before,
+            "heartbeats stopped after an order builder was dropped ({before} before, {} after)",
+            heartbeats.calls()
+        );
+
+        Ok(())
+    }
 }
 
 mod builder_authenticated {

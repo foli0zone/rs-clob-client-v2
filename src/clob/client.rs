@@ -378,7 +378,10 @@ pub struct Client<S: State = Unauthenticated> {
 ///  2. Replace the (currently non-existent) ability of specialized implementations of [`Drop`]
 ///     <https://github.com/rust-lang/rust/issues/46893>
 ///
-/// This way, the inner token is expressly cancelled when [`DroppingCancellationToken`] is dropped.
+/// This way, the inner token is expressly cancelled when the LAST [`DroppingCancellationToken`]
+/// holding it is dropped. Every clone of an authenticated [`Client`] carries one, and so does every
+/// `OrderBuilder` (`order_builder()` clones the client into it), so dropping any one of them must
+/// not stop the heartbeats the others still rely on.
 /// We also have a [`Receiver<()>`] to notify when the inner [`Client`] has been dropped so that
 /// we can avoid a race condition when calling [`Arc::into_inner`] on promotion and demotion methods.
 #[derive(Clone, Debug, Default)]
@@ -420,8 +423,14 @@ impl DroppingCancellationToken {
 #[cfg(feature = "heartbeats")]
 impl Drop for DroppingCancellationToken {
     fn drop(&mut self) {
-        if let Some((token, _, _)) = self.0.take() {
-            token.cancel();
+        if let Some((token, rx, _)) = self.0.take() {
+            // Only the last holder stops the heartbeats. Cancelling on every drop stopped them the
+            // first time a client built an order: the builder's clone of this token was dropped
+            // when `build()` returned. `Arc::into_inner` returns `Some` to exactly one of several
+            // concurrent last drops, so the token is cancelled once, by the last holder.
+            if Arc::into_inner(rx).is_some() {
+                token.cancel();
+            }
         }
     }
 }

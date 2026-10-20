@@ -60,6 +60,15 @@ pub fn token_2() -> U256 {
 }
 
 pub async fn create_authenticated(server: &MockServer) -> anyhow::Result<TestClient> {
+    create_authenticated_with_config(server, Config::builder().use_server_time(true).build()).await
+}
+
+/// [`create_authenticated`] with a caller-chosen [`Config`]. It must keep `use_server_time(true)`:
+/// the auth mock matches the signature made at the fixed server [`TIMESTAMP`].
+pub async fn create_authenticated_with_config(
+    server: &MockServer,
+    config: Config,
+) -> anyhow::Result<TestClient> {
     let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
 
     let mock = server.mock(|when, then| {
@@ -81,7 +90,6 @@ pub async fn create_authenticated(server: &MockServer) -> anyhow::Result<TestCli
             .json_body(TIMESTAMP.parse::<i64>().unwrap());
     });
 
-    let config = Config::builder().use_server_time(true).build();
     let client = Client::new(&server.base_url(), config)?
         .authentication_builder(&signer)
         .authenticate()
