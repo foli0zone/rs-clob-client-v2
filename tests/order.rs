@@ -1050,7 +1050,61 @@ mod limit {
         }
 
         #[tokio::test]
-        async fn buy_should_fail_on_too_granular_of_lot_size() -> anyhow::Result<()> {
+        async fn buy_should_round_down_too_granular_lot_size() -> anyhow::Result<()> {
+            let server = MockServer::start();
+            let client = create_authenticated(&server).await?;
+
+            ensure_requirements(&server, token_1(), TickSize::Hundredth);
+
+            let signable_order = client
+                .limit_order()
+                .token_id(token_1())
+                .price(dec!(0.78))
+                .size(dec!(12.8205))
+                .side(Side::Buy)
+                .build()
+                .await?;
+
+            // 12.8205 rounds down to 12.82; 12.82 * 0.78 = 9.9996
+            assert_eq!(signable_order.order().makerAmount, U256::from(9_999_600));
+            assert_eq!(signable_order.order().takerAmount, U256::from(12_820_000));
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn buy_should_round_size_down_to_lot_size() -> anyhow::Result<()> {
+            let server = MockServer::start();
+            let client = create_authenticated(&server).await?;
+
+            ensure_requirements(&server, token_1(), TickSize::Hundredth);
+
+            // (size, expected maker amount, expected taker amount) at price 0.5
+            let cases = [
+                (dec!(10.005), 5_000_000_u64, 10_000_000_u64),
+                (dec!(85.714286), 42_855_000, 85_710_000),
+                (dec!(3.1), 1_550_000, 3_100_000),
+            ];
+
+            for (size, maker, taker) in cases {
+                let signable_order = client
+                    .limit_order()
+                    .token_id(token_1())
+                    .price(dec!(0.5))
+                    .size(size)
+                    .side(Side::Buy)
+                    .build()
+                    .await?;
+
+                assert_eq!(signable_order.order().makerAmount, U256::from(maker));
+                assert_eq!(signable_order.order().takerAmount, U256::from(taker));
+            }
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn buy_should_fail_when_size_rounds_down_to_zero() -> anyhow::Result<()> {
             let server = MockServer::start();
             let client = create_authenticated(&server).await?;
 
@@ -1059,8 +1113,8 @@ mod limit {
             let err = client
                 .limit_order()
                 .token_id(token_1())
-                .price(dec!(0.78))
-                .size(dec!(12.8205))
+                .price(dec!(0.5))
+                .size(dec!(0.004285))
                 .side(Side::Buy)
                 .build()
                 .await
@@ -1069,7 +1123,7 @@ mod limit {
 
             assert_eq!(
                 validation_err.reason,
-                "Unable to build Order: Size 12.8205 has 4 decimal places. Maximum lot size is 2"
+                "Size 0.004285 rounds down to zero at lot size 2"
             );
 
             Ok(())
@@ -1404,22 +1458,18 @@ mod limit {
 
             ensure_requirements(&server, token_1(), TickSize::Hundredth);
 
-            let err = client
+            let signable_order = client
                 .limit_order()
                 .token_id(token_1())
                 .price(dec!(0.78))
                 .size(dec!(12.8205))
                 .side(Side::Sell)
                 .build()
-                .await
-                .unwrap_err();
+                .await?;
 
-            let validation_err = err.downcast_ref::<Validation>().unwrap();
-
-            assert_eq!(
-                validation_err.reason,
-                "Unable to build Order: Size 12.8205 has 4 decimal places. Maximum lot size is 2"
-            );
+            // 12.8205 rounds down to 12.82; 12.82 * 0.78 = 9.9996
+            assert_eq!(signable_order.order().makerAmount, U256::from(12_820_000));
+            assert_eq!(signable_order.order().takerAmount, U256::from(9_999_600));
 
             Ok(())
         }
@@ -2484,6 +2534,29 @@ mod market {
     mod sell {
         use super::*;
 
+        #[tokio::test]
+        async fn should_round_shares_down_to_lot_size() -> anyhow::Result<()> {
+            let server = MockServer::start();
+            let client = create_authenticated(&server).await?;
+
+            ensure_requirements_for_market_price(&server, token_1(), &[], &[]);
+
+            let signable_order = client
+                .market_order()
+                .token_id(token_1())
+                .price(dec!(0.5))
+                .amount(Amount::shares(dec!(85.714286))?)
+                .side(Side::Sell)
+                .build()
+                .await?;
+
+            // 85.714286 rounds down to 85.71; 85.71 * 0.5 = 42.855
+            assert_eq!(signable_order.order().makerAmount, U256::from(85_710_000));
+            assert_eq!(signable_order.order().takerAmount, U256::from(42_855_000));
+
+            Ok(())
+        }
+
         mod fok {
             use super::*;
 
@@ -3325,7 +3398,10 @@ mod market {
             .unwrap_err();
         let msg = &err.downcast_ref::<Validation>().unwrap().reason;
 
-        assert_eq!(msg, "Unable to build Order due to missing token ID");
+        assert_eq!(
+            msg,
+            "Unable to build Order: provide one of token ID or position ID"
+        );
 
         let err = client
             .market_order()
@@ -5064,5 +5140,237 @@ mod v1 {
             );
             assert_ne!(v1_hash, v2_hash);
         }
+    }
+}
+
+mod poly_v2_position_orders {
+    use std::borrow::Cow;
+
+    use alloy::dyn_abi::Eip712Domain;
+    use alloy::signers::Signer as _;
+    use alloy::signers::local::LocalSigner;
+    use alloy::sol_types::SolStruct as _;
+    use polymarket_client_sdk_v2::POLYGON;
+    use polymarket_client_sdk_v2::error::Validation;
+    use serde_json::json;
+
+    use super::*;
+    use crate::common::PRIVATE_KEY;
+
+    const EXCHANGE_V3_POLYGON: Address = address!("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa");
+
+    fn position_id() -> U256 {
+        U256::from_str(
+            "8501497159083948713316135768103773293754490207922884688769443031624417212426",
+        )
+        .expect("valid position ID")
+    }
+
+    fn mock_tick_size(server: &MockServer, position_id: U256) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/tick-size")
+                .query_param("token_id", position_id.to_string());
+            then.status(StatusCode::OK).json_body(json!({
+                "minimum_tick_size": TickSize::Hundredth.as_decimal(),
+            }));
+        })
+    }
+
+    #[tokio::test]
+    async fn position_limit_order_uses_exchange_v3_without_server_version_or_neg_risk()
+    -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+        let position_id = position_id();
+
+        let version = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/version");
+            then.status(StatusCode::OK)
+                .json_body(json!({ "version": 2 }));
+        });
+        let neg_risk = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/neg-risk");
+            then.status(StatusCode::OK)
+                .json_body(json!({ "neg_risk": true }));
+        });
+        let tick_size = mock_tick_size(&server, position_id);
+
+        let signable = client
+            .limit_order()
+            .position_id(position_id)
+            .price(dec!(0.4))
+            .size(dec!(100))
+            .side(Side::Buy)
+            .build()
+            .await?;
+
+        assert_eq!(signable.payload.version(), 3);
+        assert_eq!(signable.v3().order.tokenId, position_id);
+
+        let expected_domain = Eip712Domain {
+            name: Some(Cow::Borrowed("Polymarket CTF Exchange")),
+            version: Some(Cow::Borrowed("3")),
+            chain_id: Some(U256::from(POLYGON)),
+            verifying_contract: Some(EXCHANGE_V3_POLYGON),
+            ..Eip712Domain::default()
+        };
+        let expected_signature = signer
+            .sign_hash(&signable.v3().order.eip712_signing_hash(&expected_domain))
+            .await?;
+        let signed = client.sign(&signer, signable).await?;
+
+        assert_eq!(signed.signature, expected_signature);
+        assert_eq!(signed.v3().order.tokenId, position_id);
+        assert_eq!(
+            serde_json::to_value(&signed)?["order"]["tokenId"],
+            position_id.to_string()
+        );
+        tick_size.assert_calls(1);
+        version.assert_calls(0);
+        neg_risk.assert_calls(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn position_market_order_uses_position_id_for_order_book_and_tick_size()
+    -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        let position_id = position_id();
+        let asks = vec![
+            OrderSummary::builder()
+                .price(dec!(0.5))
+                .size(dec!(100))
+                .build(),
+        ];
+
+        let version = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/version");
+            then.status(StatusCode::OK)
+                .json_body(json!({ "version": 2 }));
+        });
+        let book = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/book")
+                .query_param("token_id", position_id.to_string());
+            then.status(StatusCode::OK).json_body(json!({
+                "market": "0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84af",
+                "asset_id": position_id,
+                "timestamp": "1000",
+                "bids": [],
+                "asks": asks,
+                "min_order_size": "5",
+                "neg_risk": false,
+                "tick_size": TickSize::Hundredth.as_decimal(),
+            }));
+        });
+        let tick_size = mock_tick_size(&server, position_id);
+
+        let signable = client
+            .market_order()
+            .position_id(position_id)
+            .amount(Amount::usdc(dec!(10))?)
+            .side(Side::Buy)
+            .build()
+            .await?;
+
+        assert_eq!(signable.payload.version(), 3);
+        assert_eq!(signable.v3().order.tokenId, position_id);
+        assert_eq!(signable.v3().order.makerAmount, U256::from(10_000_000));
+        assert_eq!(signable.v3().order.takerAmount, U256::from(20_000_000));
+        book.assert_calls(1);
+        tick_size.assert_calls(1);
+        version.assert_calls(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn position_posts_refresh_version_cache_on_mismatch() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+        let position_id = position_id();
+        let tick_size = mock_tick_size(&server, position_id);
+        let version = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/version");
+            then.status(StatusCode::OK)
+                .json_body(json!({ "version": 2 }));
+        });
+        let post_order = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/order");
+            then.status(StatusCode::BAD_REQUEST)
+                .body("order_version_mismatch");
+        });
+        let post_orders = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/orders");
+            then.status(StatusCode::BAD_REQUEST)
+                .body("order_version_mismatch");
+        });
+
+        let first = client
+            .limit_order()
+            .position_id(position_id)
+            .price(dec!(0.4))
+            .size(dec!(100))
+            .side(Side::Buy)
+            .build()
+            .await?;
+        let second = client
+            .limit_order()
+            .position_id(position_id)
+            .price(dec!(0.4))
+            .size(dec!(100))
+            .side(Side::Buy)
+            .build()
+            .await?;
+        let first = client.sign(&signer, first).await?;
+        let second = client.sign(&signer, second).await?;
+
+        client
+            .post_order(first)
+            .await
+            .expect_err("version mismatch should fail the post");
+        client
+            .post_orders(vec![second])
+            .await
+            .expect_err("version mismatch should fail the batch post");
+
+        post_order.assert_calls(1);
+        post_orders.assert_calls(1);
+        version.assert_calls(2);
+        tick_size.assert_calls(1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_rejects_token_and_position_ids_together() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+
+        let err = client
+            .limit_order()
+            .token_id(token_1())
+            .position_id(position_id())
+            .price(dec!(0.4))
+            .size(dec!(100))
+            .side(Side::Buy)
+            .build()
+            .await
+            .expect_err("both identifiers must be rejected");
+        let validation = err
+            .downcast_ref::<Validation>()
+            .expect("expected Validation error");
+
+        assert_eq!(
+            validation.reason,
+            "Unable to build Order: provide exactly one of token ID or position ID"
+        );
+
+        Ok(())
     }
 }
