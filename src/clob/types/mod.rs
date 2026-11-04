@@ -11,7 +11,7 @@ use strum_macros::Display;
 
 use crate::Result;
 use crate::auth::ApiKey;
-use crate::clob::order_builder::LOT_SIZE_SCALE;
+use crate::clob::order_builder::round_down_to_lot_size;
 use crate::clob::utilities::USDC_DECIMALS;
 use crate::error::Error;
 use crate::types::Decimal;
@@ -190,16 +190,16 @@ impl Amount {
         Ok(Amount(AmountInner::Usdc(normalized)))
     }
 
+    /// Creates a share-denominated amount. A value with more than 2 decimal places is rounded
+    /// down to the lot size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a non-zero `value` rounds down to zero.
     pub fn shares(value: Decimal) -> Result<Amount> {
-        let normalized = value.normalize();
-        if normalized.scale() > LOT_SIZE_SCALE {
-            return Err(Error::validation(format!(
-                "Unable to build Amount with {} decimal points, must be <= {LOT_SIZE_SCALE}",
-                normalized.scale()
-            )));
-        }
+        let rounded = round_down_to_lot_size(value)?;
 
-        Ok(Amount(AmountInner::Shares(normalized)))
+        Ok(Amount(AmountInner::Shares(rounded.normalize())))
     }
 
     #[must_use]
@@ -522,13 +522,16 @@ pub use v2::Order as OrderV2;
 /// Deprecated alias preserved for callers that predate the V1/V2 split. Resolves to [`OrderV2`].
 pub type Order = OrderV2;
 
-/// V2 order payload: the signed struct plus the out-of-struct `expiration`.
+/// V2/V3 order payload: the signed struct plus the out-of-struct `expiration`.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrderPayloadV2 {
     pub order: OrderV2,
     pub expiration: U256,
 }
+
+/// V3 reuses the V2 signed order structure and wire payload shape.
+pub type OrderPayloadV3 = OrderPayloadV2;
 
 /// V1 order payload. `expiration` lives inside the signed struct.
 #[non_exhaustive]
@@ -543,6 +546,7 @@ pub struct OrderPayloadV1 {
 pub enum OrderPayload {
     V1(OrderPayloadV1),
     V2(OrderPayloadV2),
+    V3(OrderPayloadV3),
 }
 
 impl Default for OrderPayload {
@@ -558,88 +562,144 @@ impl OrderPayload {
         OrderPayload::V2(OrderPayloadV2 { order, expiration })
     }
 
+    /// Construct a V3 payload for a Polymarket V2 position order.
+    #[must_use]
+    pub fn new_v3(order: OrderV2, expiration: U256) -> Self {
+        OrderPayload::V3(OrderPayloadV3 { order, expiration })
+    }
+
     /// Construct a V1 payload.
     #[must_use]
     pub fn new_v1(order: OrderV1) -> Self {
         OrderPayload::V1(OrderPayloadV1 { order })
     }
 
-    /// The protocol version this payload targets (1 or 2).
+    /// The protocol version this payload targets (1, 2, or 3).
     #[must_use]
     pub fn version(&self) -> u32 {
         match self {
             OrderPayload::V1(_) => 1,
             OrderPayload::V2(_) => 2,
+            OrderPayload::V3(_) => 3,
         }
     }
 
-    /// Returns the V2 order reference, or `None` for V1 payloads.
+    /// Returns the V2 order reference, or `None` for V1/V3 payloads.
     #[must_use]
     pub fn as_v2(&self) -> Option<&OrderV2> {
         match self {
             OrderPayload::V2(p) => Some(&p.order),
-            OrderPayload::V1(_) => None,
+            OrderPayload::V1(_) | OrderPayload::V3(_) => None,
         }
     }
 
-    /// Returns the V1 order reference, or `None` for V2 payloads.
+    /// Returns the V3 order reference, or `None` for V1/V2 payloads.
+    #[must_use]
+    pub fn as_v3(&self) -> Option<&OrderV2> {
+        match self {
+            OrderPayload::V3(p) => Some(&p.order),
+            OrderPayload::V1(_) | OrderPayload::V2(_) => None,
+        }
+    }
+
+    /// Returns the V1 order reference, or `None` for V2/V3 payloads.
     #[must_use]
     pub fn as_v1(&self) -> Option<&OrderV1> {
         match self {
             OrderPayload::V1(p) => Some(&p.order),
-            OrderPayload::V2(_) => None,
+            OrderPayload::V2(_) | OrderPayload::V3(_) => None,
         }
     }
 }
 
 impl SignableOrder {
-    /// Returns the V2 order struct.
+    /// Returns the V2/V3 order struct.
     ///
     /// # Panics
     ///
-    /// Panics if this is a V1 order. Callers that may encounter either version should
+    /// Panics if this is a V1 order. Callers that may encounter any version should
     /// inspect [`SignableOrder::payload`] directly.
     #[must_use]
     pub fn order(&self) -> &OrderV2 {
-        &self.v2().order
+        match &self.payload {
+            OrderPayload::V2(p) | OrderPayload::V3(p) => &p.order,
+            OrderPayload::V1(_) => panic!("SignableOrder is V1; match on .payload directly"),
+        }
     }
 
     /// Returns the V2 payload.
     ///
     /// # Panics
     ///
-    /// Panics if this is a V1 order.
+    /// Panics if this is not a V2 order.
     #[must_use]
     pub fn v2(&self) -> &OrderPayloadV2 {
         match &self.payload {
             OrderPayload::V2(p) => p,
-            OrderPayload::V1(_) => panic!("SignableOrder is V1; match on .payload directly"),
+            OrderPayload::V1(_) | OrderPayload::V3(_) => {
+                panic!("SignableOrder is not V2; match on .payload directly")
+            }
+        }
+    }
+
+    /// Returns the V3 payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is not a V3 order.
+    #[must_use]
+    pub fn v3(&self) -> &OrderPayloadV3 {
+        match &self.payload {
+            OrderPayload::V3(p) => p,
+            OrderPayload::V1(_) | OrderPayload::V2(_) => {
+                panic!("SignableOrder is not V3; match on .payload directly")
+            }
         }
     }
 }
 
 impl SignedOrder {
-    /// Returns the V2 order struct.
+    /// Returns the V2/V3 order struct.
     ///
     /// # Panics
     ///
-    /// Panics if this is a V1 order. Callers that may encounter either version should
+    /// Panics if this is a V1 order. Callers that may encounter any version should
     /// inspect [`SignedOrder::payload`] directly.
     #[must_use]
     pub fn order(&self) -> &OrderV2 {
-        &self.v2().order
+        match &self.payload {
+            OrderPayload::V2(p) | OrderPayload::V3(p) => &p.order,
+            OrderPayload::V1(_) => panic!("SignedOrder is V1; match on .payload directly"),
+        }
     }
 
     /// Returns the V2 payload.
     ///
     /// # Panics
     ///
-    /// Panics if this is a V1 order.
+    /// Panics if this is not a V2 order.
     #[must_use]
     pub fn v2(&self) -> &OrderPayloadV2 {
         match &self.payload {
             OrderPayload::V2(p) => p,
-            OrderPayload::V1(_) => panic!("SignedOrder is V1; match on .payload directly"),
+            OrderPayload::V1(_) | OrderPayload::V3(_) => {
+                panic!("SignedOrder is not V2; match on .payload directly")
+            }
+        }
+    }
+
+    /// Returns the V3 payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is not a V3 order.
+    #[must_use]
+    pub fn v3(&self) -> &OrderPayloadV3 {
+        match &self.payload {
+            OrderPayload::V3(p) => p,
+            OrderPayload::V1(_) | OrderPayload::V2(_) => {
+                panic!("SignedOrder is not V3; match on .payload directly")
+            }
         }
     }
 }
@@ -820,7 +880,7 @@ impl Serialize for SignedOrder {
         let mut st = serializer.serialize_struct("SignedOrder", field_count)?;
 
         match &self.payload {
-            OrderPayload::V2(payload) => {
+            OrderPayload::V2(payload) | OrderPayload::V3(payload) => {
                 let order = &payload.order;
                 let side = Side::try_from(order.side).map_err(S::Error::custom)?;
                 let body = OrderV2WithSignature {
@@ -880,6 +940,7 @@ mod tests {
     use serde_json::to_value;
 
     use super::*;
+    use crate::clob::order_builder::LOT_SIZE_SCALE;
     use crate::error::Validation;
 
     #[test]
@@ -950,15 +1011,25 @@ mod tests {
     }
 
     #[test]
-    fn improper_shares_lot_size_should_fail() {
-        let Err(err) = Amount::shares(dec!(0.23400)) else {
+    fn shares_beyond_lot_size_should_round_down() -> Result<()> {
+        assert_eq!(Amount::shares(dec!(0.23400))?.as_inner(), dec!(0.23));
+        assert_eq!(Amount::shares(dec!(10.005))?.as_inner(), dec!(10));
+        assert_eq!(Amount::shares(dec!(85.714286))?.as_inner(), dec!(85.71));
+        assert_eq!(Amount::shares(dec!(3.1))?.as_inner(), dec!(3.1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn shares_rounding_down_to_zero_should_fail() {
+        let Err(err) = Amount::shares(dec!(0.004285)) else {
             panic!()
         };
 
         let message = err.downcast_ref::<Validation>().unwrap();
         assert_eq!(
             message.reason,
-            format!("Unable to build Amount with 3 decimal points, must be <= {LOT_SIZE_SCALE}")
+            format!("Size 0.004285 rounds down to zero at lot size {LOT_SIZE_SCALE}")
         );
     }
 
